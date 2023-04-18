@@ -1,18 +1,40 @@
 """Welcome to Pynecone! This file outlines the steps to create a basic app."""
-from pcconfig import config
-
 import pynecone as pc
-
+import keyring
+import google
 """Main script for the autogpt package."""
 import logging
-from colorama import Fore
+from colorama import Fore, Style
 from autogpt.agent.agent import Agent
+from autogpt.app import execute_command, get_command
+from autogpt.chat import chat_with_ai, create_chat_message
+from autogpt.json_fixes.master_json_fix_method import fix_json_using_multiple_techniques
+from autogpt.json_validation.validate_json import validate_json
+from autogpt.logs import logger, print_assistant_thoughts
+from autogpt.speech import say_text
 from autogpt.args import parse_arguments
-from autogpt.config import Config, check_openai_api_key
+from autogpt.config.ai_config import AIConfig
+from autogpt.config import Config
 from autogpt.logs import logger
 from autogpt.memory import get_memory
 from autogpt.prompt import construct_prompt
 # Load environment variables from .env file
+from autogpt.spinner import Spinner
+from autogpt.setup import prompt_user
+from googletrans import Translator
+
+translator = Translator()
+
+def trans(msg, dest: str = None) -> str:
+    if not dest:
+        lang = translator.detect(msg).lang
+        if lang == "en":
+            dest = "ko"
+        elif lang == "ko":
+            dest = "en"
+        else:
+            dest = "en"
+    return translator.translate(msg, dest=dest).text
 
 question_style = {
     'bg': 'white',
@@ -22,73 +44,47 @@ question_style = {
     'align_items': 'left',
 }
 
-# def main() -> None:
-#     """Main function for the script"""
-#     cfg = Config()
-#     # TODO: fill in llm values here
-#     check_openai_api_key()
-#     parse_arguments()
-#     logger.set_level(logging.DEBUG if cfg.debug_mode else logging.INFO)
-#     ai_name = ""
-#     system_prompt = construct_prompt()
-#     # print(prompt)
-#     # Initialize variables
-#     full_message_history = []
-#     next_action_count = 0
-#     # Make a constant:
-#     triggering_prompt = (
-#         "Determine which next command to use, and respond using the"
-#         " format specified above:"
-#     )
-#     # Initialize memory and make sure it is empty.
-#     # this is particularly important for indexing and referencing pinecone memory
-#     memory = get_memory(cfg, init=True)
-#     logger.typewriter_log(
-#         f"Using memory of type:", Fore.GREEN, f"{memory.__class__.__name__}"
-#     )
-#     logger.typewriter_log(f"Using Browser:", Fore.GREEN, cfg.selenium_web_browser)
-#     agent = Agent(
-#         ai_name=ai_name,
-#         memory=memory,
-#         full_message_history=full_message_history,
-#         next_action_count=next_action_count,
-#         system_prompt=system_prompt,
-#         triggering_prompt=triggering_prompt,
-#     )
-#     agent.start_interaction_loop()
+cfg = Config()
+cfg.set_openai_api_key(keyring.get_password('openai_api_key','pevjant'))
 
-
-docs_url = "https://pynecone.io/docs/getting-started/introduction"
-filename = f"{config.app_name}/{config.app_name}.py"
-
+config = AIConfig.load(cfg.ai_settings_file)
+memory = get_memory(cfg, init=True)
 class History(pc.Base):
     thoughts: str
     reasoning: str
-    plans: list
+    plans: list[str]
     criticism: str
     system: str
 
 class State(pc.State):
- history: list[History] = []
-
+    history: list[History] = []
     is_thinking = False
     is_started = False
-
-    ai_name: str = '유튜버-GPT'
-    ai_role: str = '유튜브 채널을 운영하고 영상 콘텐츠를 통해 수익을 창출하는 인공지능입니다.'
-    ai_goals: list = [
-        '월 광고 수익 200만원 달성',
-        '채널 구독자 수 10만명 달성',
-        '영상 콘텐츠 주제 선정',
-    ]
+    ai_name: str
+    ai_role: str
+    ai_goals: list[str]
+    prompt: str
+    openai_api_key = cfg.openai_api_key
+    print(memory.get_stats())
+    triggering_prompt = (
+        "Determine which next command to use, and respond using the"
+        " format specified above:"
+    )
+    if not config.ai_name:
+        config = prompt_user()
+        config.save(cfg.ai_settings_file)
+    
+    ai_name = config.ai_name
+    ai_role = config.ai_role
+    ai_goals = config.ai_goals
+    prompt = config.construct_full_prompt()
 
     # Initialize variables
     full_message_history:list = []
     result: str = None
-    prompt: str = None
-    openai_api_key = ''
     # Make a constant:
-    user_input: str = "Determine which next command to use, and respond using the format specified above:"
+    user_input: str = None
+    command_name: str = None
 
     def set_ai_goals_0(self, goal):
         self.ai_goals[0] = goal
@@ -96,6 +92,17 @@ class State(pc.State):
         self.ai_goals[1] = goal
     def set_ai_goals_2(self, goal):
         self.ai_goals[2] = goal
+    def set_ai_goals_3(self, goal):
+        self.ai_goals[3] = goal
+    def set_ai_goals_4(self, goal):
+        self.ai_goals[4] = goal
+    def set_user_input(self, user_input: str):
+        if not user_input:
+            user_input = "GENERATE NEXT COMMAND JSON"
+            self.command_name = None
+        elif len(user_input) > 1:
+            self.command_name = "human_feedback"
+        self.user_input = user_input
 
     def set_openai_api_key(self, key):
         if key:
@@ -114,7 +121,7 @@ class State(pc.State):
 
         print(self.prompt)
 
-        self.cont()
+        self.continue_think()
 
     def starting(self):
         self.is_started = True
@@ -122,35 +129,88 @@ class State(pc.State):
     def processing(self):
         self.is_thinking = True
 
-    def cont(self):
-        start_time = time.time()
-
+    def continue_think(self):
         try:
             with Spinner("Thinking... "):
-                assistant_reply = chat.chat_with_ai(
+                assistant_reply = chat_with_ai(
                     self.prompt,
-                    self.user_input,
+                    self.triggering_prompt,
                     self.full_message_history,
-                    mem.permanent_memory,
+                    memory,
                     cfg.fast_token_limit)
 
+
+            assistant_reply_json = fix_json_using_multiple_techniques(assistant_reply)
             # Print Assistant thoughts
-            reply = print_assistant_thoughts(assistant_reply)
+            if assistant_reply_json != {}:
+                validate_json(assistant_reply_json, "llm_response_format_1")
+                # Get command name and arguments
+                try:
+                    reply = print_assistant_thoughts(self.ai_name, assistant_reply_json)
+                    if not reply:
+                        logger.error("ERROR: ", Fore.RED, "reply is empty")
+                    else:
+                        logger.typewriter_log("REPLY: ", Fore.CYAN, str(reply))
+                    command_name, arguments = get_command(assistant_reply_json)
+                    # command_name, arguments = assistant_reply_json_valid["command"]["name"], assistant_reply_json_valid["command"]["args"]
+                    if cfg.speak_mode:
+                        say_text(f"I want to execute {command_name}")
+                except Exception as e:
+                    logger.error("Error: \n", str(e))
 
-            if not reply['thoughts']:
-                raise Exception('Error')
+                ### GET USER AUTHORIZATION TO EXECUTE COMMAND ###
+                # Get key press: Prompt the user to press enter to continue or escape
+                # to exit
+            logger.typewriter_log(
+                "NEXT ACTION: ",
+                Fore.CYAN,
+                f"COMMAND = {Fore.CYAN}{command_name}{Style.RESET_ALL}  "
+                f"ARGUMENTS = {Fore.CYAN}{arguments}{Style.RESET_ALL}",
+            )
+            user_input = "GENERATE NEXT COMMAND JSON"
+            if not State.user_input:
+                user_input = State.user_input
+                command_name = "human_feedback"
+            # Execute command
+            if command_name is not None and command_name.lower().startswith("error"):
+                result = (
+                    f"Command {command_name} threw the following error: {arguments}"
+                )
+            elif command_name == "human_feedback":
+                result = f"Human feedback: {user_input}"
+            else:
+                result = (
+                    f"Command {command_name} returned: "
+                    f"{execute_command(command_name, arguments)}"
+                )
+                
+            memory_to_add = (
+                f"Assistant Reply: {assistant_reply} "
+                f"\nResult: {result} "
+                f"\nHuman Feedback: {user_input} "
+            )
 
-            # Get command name and arguments
-            command_name, arguments = cmd.get_command(assistant_reply)
-            result = f"Command {command_name} returned: {cmd.execute_command(command_name, arguments)}"
-
-            # Check if there's a result from the command append it to the message history
-            self.full_message_history.append(chat.create_chat_message("system", result))
-            print_to_console("SYSTEM: ", Fore.YELLOW, result)
+            memory.add(memory_to_add)
+            # Check if there's a result from the command append it to the message
+            # history
+            if result is not None:
+                self.full_message_history.append(create_chat_message("system", result))
+                logger.typewriter_log("SYSTEM: ", Fore.YELLOW, result)
+            else:
+                self.full_message_history.append(
+                    create_chat_message("system", "Unable to execute command")
+                )
+                logger.typewriter_log(
+                    "SYSTEM: ", Fore.YELLOW, "Unable to execute command"
+                )
 
             plans = []
             if 'plans' in reply and reply['plans']:
                 plans = [plan.replace('- ', '') for plan in reply['plans']]
+
+            logger.typewriter_log("PROMPRT", 
+                        Fore.YELLOW, 
+                    f"ORIGIN = {Fore.CYAN}{memory}{Style.RESET_ALL}")
 
             self.history = [History(
                 thoughts=reply['thoughts'],
@@ -161,17 +221,15 @@ class State(pc.State):
             )] + self.history
         except Exception as e:
             pc.window_alert(str(e))
+            logger.error(str(e))
         finally:
             self.is_thinking = False
-            print_to_console("DONE!", Fore.CYAN, f' in {(time.time() - start_time):.2f}s.')
-
 
 
 def header():
     return pc.vstack(
         pc.heading('스스로 생각하는 인공지능 Auto-GPT'),
         pc.divider(),
-        pc.markdown('유튜브 [빵형의 개발도상국](https://www.youtube.com/@bbanghyong), 창의적인 AI 솔루션 [더매트릭스](https://www.m47rix.com)'),
         pc.accordion(
             items=[
                 ('기능',
@@ -190,53 +248,77 @@ def header():
                 pc.hstack(
                     pc.text('AI 이름', width='150px'),
                     pc.input(
-                        placeholder='기업가-GPT',
-                        default_value='유튜버-GPT',
+                        placeholder=State.ai_name,
+                        default_value=State.ai_name,
                         on_change=State.set_ai_name
                     ),
                 ),
                 pc.hstack(
                     pc.text('최종 목표', width='150px', as_='b'),
                     pc.input(
-                        placeholder='유튜브 채널을 운영하고 영상 콘텐츠를 통해 수익을 창출하는 인공지능입니다.',
-                        default_value='유튜브 채널을 운영하고 영상 콘텐츠를 통해 수익을 창출하는 인공지능입니다.',
+                        placeholder=State.ai_role,
+                        default_value=State.ai_role,
                         on_change=State.set_ai_role
                     ),
                 ),
                 pc.hstack(
                     pc.text('세부 목표 1', width='150px'),
                     pc.input(
-                        placeholder='기업 총 가치 높이기',
-                        default_value='월 광고 수익 200만원 달성',
+                        placeholder=State.ai_goals[0],
+                        default_value=State.ai_goals[0],
                         on_change=State.set_ai_goals_0
                     ),
                 ),
                 pc.hstack(
                     pc.text('세부 목표 2', width='150px'),
                     pc.input(
-                        placeholder='트위터 계정 팔로워 수 증가',
-                        default_value='채널 구독자 수 10만명 달성',
+                        placeholder=State.ai_goals[1],
+                        default_value=State.ai_goals[1],
                         on_change=State.set_ai_goals_1
                     ),
                 ),
                 pc.hstack(
                     pc.text('세부 목표 3', width='150px'),
                     pc.input(
-                        placeholder='다양한 비즈니스를 자동으로 개발하고 관리하기',
-                        default_value='영상 콘텐츠 주제 선정',
+                        placeholder=State.ai_goals[2],
+                        default_value=State.ai_goals[2],
                         on_change=State.set_ai_goals_2
+                    ),
+                ),
+                pc.hstack(
+                    pc.text('세부 목표 4', width='150px'),
+                    pc.input(
+                        placeholder=State.ai_goals[3],
+                        default_value=State.ai_goals[3],
+                        on_change=State.set_ai_goals_3
+                    ),
+                ),
+                pc.hstack(
+                    pc.text('세부 목표 5', width='150px'),
+                    pc.input(
+                        placeholder=State.ai_goals[4],
+                        default_value=State.ai_goals[4],
+                        on_change=State.set_ai_goals_4
                     ),
                 ),
                 pc.hstack(
                     pc.text('OpenAI API Key', width='150px'),
                     pc.input(
                         placeholder='sk-...',
-                        default_value=State.openai_api_key,
+                        default_value=cfg.openai_api_key,
                         on_change=State.set_openai_api_key
                     ),
                 ),
             )
         )]),
+        pc.hstack(
+                    pc.text('사용자 의견', width='150px'),
+                    pc.input(
+                        placeholder='',
+                        default_value='',
+                        on_change=State.set_user_input
+                    ),
+                ),
         pc.center(
             pc.cond(State.is_started,
                 pc.text(),
@@ -259,7 +341,7 @@ def header():
                             color='white',
                             width='6em',
                             padding='1em',
-                            on_click=[State.processing, State.cont],
+                            on_click=[State.processing, State.continue_think],
                         ),
                         pc.button(
                             '처음부터',
@@ -276,12 +358,66 @@ def header():
         style=question_style,
     )
 
-def index() -> pc.Component:
+def history_block(h: History):
+    return pc.vstack(
+        pc.heading(h.thoughts, size='md'),
+        pc.list(
+            pc.cond(h.reasoning,
+                pc.list_item(
+                    pc.icon(tag='info_outline', color='green'),
+                    ' ' + h.reasoning,
+                )
+            ),
+            pc.ordered_list(items=h.plans),
+            pc.cond(h.criticism,
+                pc.list_item(
+                    pc.icon(tag='warning_two', color='red'),
+                    ' ' + h.criticism
+                )
+            ),
+            pc.accordion(
+                items=[
+                    ('시스템',
+                    pc.code_block(h.system, wrap_long_lines=True)),
+                ]
+            ),
+            spacing='.25em',
+        ),
+        style=question_style,
+    )
+
+def index():
     return pc.center(
         pc.vstack(
             header(),
+            pc.cond(
+                State.is_thinking,
+                pc.vstack(
+                    pc.circular_progress(
+                        pc.circular_progress_label(
+                            'Thinking', color='rgb(0, 0, 0)'
+                        ),
+                        is_indeterminate=True,
+                        color='rgb(0, 0, 0)',
+                    ),
+                    style={
+                        'bg': 'white',
+                        'padding': '2em',
+                        'border_radius': '25px',
+                        'w': '100vh',
+                        'align_items': 'center',
+                    },
+                ),
+            ),
+            pc.foreach(State.history, history_block),
+            spacing='1em',
+            width='100vh',
         ),
-        padding_top="10%",
+        padding_y='2em',
+        height='100vh',
+        align_items='top',
+        bg='#ededed',
+        overflow='auto',
     )
 
 

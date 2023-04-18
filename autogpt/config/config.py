@@ -224,6 +224,7 @@ class Config(metaclass=Singleton):
     def set_openai_api_key(self, value: str) -> None:
         """Set the OpenAI API key value."""
         self.openai_api_key = value
+        openai.api_key = value
 
     def set_elevenlabs_api_key(self, value: str) -> None:
         """Set the ElevenLabs API key value."""

@@ -297,12 +297,13 @@ def print_assistant_thoughts(ai_name, assistant_reply):
 
 def print_assistant_thoughts(
     ai_name: object, assistant_reply_json_valid: object
-) -> None:
+) -> dict:
+    result = {}
     assistant_thoughts_reasoning = None
     assistant_thoughts_plan = None
     assistant_thoughts_speak = None
     assistant_thoughts_criticism = None
-
+    
     assistant_thoughts = assistant_reply_json_valid.get("thoughts", {})
     assistant_thoughts_text = assistant_thoughts.get("text")
     if assistant_thoughts:
@@ -327,7 +328,13 @@ def print_assistant_thoughts(
         for line in lines:
             line = line.lstrip("- ")
             logger.typewriter_log("- ", Fore.GREEN, line.strip())
+        result['plans'] = lines
     logger.typewriter_log("CRITICISM:", Fore.YELLOW, f"{assistant_thoughts_criticism}")
     # Speak the assistant's thoughts
     if CFG.speak_mode and assistant_thoughts_speak:
         say_text(assistant_thoughts_speak)
+
+    result['thoughts'] = assistant_thoughts_text
+    result['reasoning'] = assistant_thoughts_reasoning
+    result['criticism'] = assistant_thoughts_criticism
+    return result

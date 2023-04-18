@@ -158,6 +158,8 @@ vicuna-*
 
 # mac
 .DS_Store
+pynecone.db
+.web
 
 openai/
 
