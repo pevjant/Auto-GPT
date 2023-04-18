@@ -4,6 +4,7 @@ import keyring
 import google
 """Main script for the autogpt package."""
 import logging
+import json
 from colorama import Fore, Style
 from autogpt.agent.agent import Agent
 from autogpt.app import execute_command, get_command
@@ -47,8 +48,12 @@ question_style = {
 cfg = Config()
 cfg.set_openai_api_key(keyring.get_password('openai_api_key','pevjant'))
 
-config = AIConfig.load(cfg.ai_settings_file)
-memory = get_memory(cfg, init=True)
+config = AIConfig.load()
+if not config.ai_name:
+    config = AIConfig("Auto-GPT", "", [""] * 5)
+    config.save()
+memory = get_memory(cfg)
+
 class History(pc.Base):
     thoughts: str
     reasoning: str
@@ -65,26 +70,65 @@ class State(pc.State):
     ai_goals: list[str]
     prompt: str
     openai_api_key = cfg.openai_api_key
-    print(memory.get_stats())
+    
     triggering_prompt = (
         "Determine which next command to use, and respond using the"
         " format specified above:"
     )
-    if not config.ai_name:
-        config = prompt_user()
-        config.save(cfg.ai_settings_file)
     
-    ai_name = config.ai_name
-    ai_role = config.ai_role
-    ai_goals = config.ai_goals
-    prompt = config.construct_full_prompt()
-
     # Initialize variables
     full_message_history:list = []
     result: str = None
     # Make a constant:
     user_input: str = None
     command_name: str = None
+
+    def __init__(self):
+        super().__init__()
+        self.ai_name = config.ai_name
+        self.ai_role = config.ai_role
+        self.ai_goals = config.ai_goals
+        self.prompt = config.construct_full_prompt()
+        print(f'memory.data.texts: {len(memory.data.texts)}')
+        if len(memory.data.texts) > 0:
+            self.restore_history()
+
+    def restore_history(self):
+        for mem in memory.data.texts:
+            data = json.loads(mem)
+            assistant_reply = data["Assistant Reply"]
+            result = data["Result"]
+            user_input = data["Human Feedback"]
+            if assistant_reply is not None:
+                assistant_reply_json = fix_json_using_multiple_techniques(assistant_reply)
+                if assistant_reply_json != {}:
+                    validate_json(assistant_reply_json, "llm_response_format_1")
+                    # Get command name and arguments
+                    try:
+                        reply = print_assistant_thoughts(self.ai_name, assistant_reply_json)
+                        plans = []
+                        if 'plans' in reply and reply['plans']:
+                            plans = [plan.replace('- ', '') for plan in reply['plans']]
+                        msg = (
+                            f"{reply['thoughts']}"
+                            f"\n{reply['reasoning']}"
+                            f"\n{reply['criticism']}"
+                            f"\n{result}"
+                            f"\n{plans}"
+                            )
+                        trans_msg = trans(msg).split("\n")
+                        self.history = [History(
+                            thoughts=trans_msg[0],
+                            reasoning=trans_msg[1],
+                            plans=trans_msg[-len(plans):-1],
+                            criticism=trans_msg[2],
+                            system=trans_msg[3],
+                        )] + self.history
+                    except Exception as e:
+                        logger.error(str(e))
+            if result is not None:
+                self.full_message_history.append(create_chat_message("system", result))
+
 
     def set_ai_goals_0(self, goal):
         self.ai_goals[0] = goal
@@ -96,10 +140,18 @@ class State(pc.State):
         self.ai_goals[3] = goal
     def set_ai_goals_4(self, goal):
         self.ai_goals[4] = goal
+    def set_ai_name(self, name):
+        self.ai_name = name
+    def set_ai_role(self, role):
+        self.ai_role = role 
+    def set_prompt(self, prompt):
+        self.prompt = prompt
     def set_user_input(self, user_input: str):
+        self.command_name = None
         if not user_input:
             user_input = "GENERATE NEXT COMMAND JSON"
-            self.command_name = None
+        elif user_input.lower() == "n":
+            user_input = "EXIT"
         elif len(user_input) > 1:
             self.command_name = "human_feedback"
         self.user_input = user_input
@@ -118,9 +170,6 @@ class State(pc.State):
         config.save()
 
         self.prompt = config.construct_full_prompt()
-
-        print(self.prompt)
-
         self.continue_think()
 
     def starting(self):
@@ -183,14 +232,19 @@ class State(pc.State):
                     f"Command {command_name} returned: "
                     f"{execute_command(command_name, arguments)}"
                 )
-                
-            memory_to_add = (
-                f"Assistant Reply: {assistant_reply} "
-                f"\nResult: {result} "
-                f"\nHuman Feedback: {user_input} "
-            )
-
-            memory.add(memory_to_add)
+            memory_to_add = {
+                "Assistant Reply" : assistant_reply,
+                "Result": result,
+                "Human Feedback": user_input,
+            }
+          
+            # memory_to_add = {
+            #     f"Assistant Reply: {assistant_reply} "
+            #     f"\nResult: {result} "
+            #     f"\nHuman Feedback: {user_input} "
+            # }
+            json_str = json.dumps(memory_to_add)
+            memory.add(json_str)
             # Check if there's a result from the command append it to the message
             # history
             if result is not None:
@@ -212,18 +266,28 @@ class State(pc.State):
                         Fore.YELLOW, 
                     f"ORIGIN = {Fore.CYAN}{memory}{Style.RESET_ALL}")
 
+            msg = (
+                f"{reply['thoughts']}"
+                f"\n{reply['reasoning']}"
+                f"\n{reply['criticism']}"
+                f"\n{result}"
+                f"\n{plans}"
+                )
+            trans_msg = trans(msg).split("\n")
             self.history = [History(
-                thoughts=reply['thoughts'],
-                reasoning=reply['reasoning'],
-                plans=plans,
-                criticism=reply['criticism'],
-                system=result,
+                thoughts=trans_msg[0],
+                reasoning=trans_msg[1],
+                plans=trans_msg[-len(plans):-1],
+                criticism=trans_msg[2],
+                system=trans_msg[3],
             )] + self.history
         except Exception as e:
             pc.window_alert(str(e))
             logger.error(str(e))
         finally:
             self.is_thinking = False
+            # config = AIConfig(self.ai_name, self.ai_role, self.ai_goals)
+            # config.save()
 
 
 def header():
