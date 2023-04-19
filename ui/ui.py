@@ -1,10 +1,7 @@
-"""Welcome to Pynecone! This file outlines the steps to create a basic app."""
 import pynecone as pc
 import keyring
-import google
-"""Main script for the autogpt package."""
-import logging
-import json
+import traceback
+import orjson
 from colorama import Fore, Style
 from autogpt.agent.agent import Agent
 from autogpt.app import execute_command, get_command
@@ -13,10 +10,9 @@ from autogpt.json_fixes.master_json_fix_method import fix_json_using_multiple_te
 from autogpt.json_validation.validate_json import validate_json
 from autogpt.logs import logger, print_assistant_thoughts
 from autogpt.speech import say_text
-from autogpt.args import parse_arguments
+
 from autogpt.config.ai_config import AIConfig
 from autogpt.config import Config
-from autogpt.logs import logger
 from autogpt.memory import get_memory
 from autogpt.prompt import construct_prompt
 # Load environment variables from .env file
@@ -62,9 +58,13 @@ class History(pc.Base):
     system: str
 
 class State(pc.State):
+    next_action_count = 0
     history: list[History] = []
     is_thinking = False
     is_started = False
+    is_restoring_history = False
+    is_exist_prev_histoy = False
+    is_loading = False
     ai_name: str
     ai_role: str
     ai_goals: list[str]
@@ -83,53 +83,79 @@ class State(pc.State):
     user_input: str = None
     command_name: str = None
 
-    def __init__(self):
-        super().__init__()
-        self.ai_name = config.ai_name
-        self.ai_role = config.ai_role
-        self.ai_goals = config.ai_goals
-        self.prompt = config.construct_full_prompt()
-        print(f'memory.data.texts: {len(memory.data.texts)}')
-        if len(memory.data.texts) > 0:
-            self.restore_history()
 
+    # def prepare(self):
+    ai_name = config.ai_name
+    ai_role = config.ai_role
+    ai_goals = config.ai_goals
+    prompt = config.construct_full_prompt()
+    print(f'memory.data.texts: {len(memory.data.texts)}')
+    if len(memory.data.texts) > 0:
+        is_exist_prev_histoy = True
+        
+    def trans_replay_and_history(self, reply) -> dict:
+        try:
+            plans = []
+            plans_split = "\n"
+            msg_split = "\n* "
+            if 'plans' in reply and reply['plans']:
+                plans = ''.join([plan.replace('- ', '') if i == 0 else plan.replace('- ', plans_split) for i, plan in enumerate(reply['plans'])])
+
+            
+            msg = (
+                f"{reply['thoughts']}"
+                f"{msg_split}{reply['reasoning']}"
+                f"{msg_split}{reply['criticism']}"
+                f"{msg_split}{plans}"
+                )
+            
+            trans_msg = trans(msg, "ko")
+            trans_msg = trans_msg.split(msg_split)
+
+            reply['thoughts'] = trans_msg[0]
+            reply['reasoning'] = trans_msg[1]
+            reply['criticism'] = trans_msg[2]
+            reply['plans'] = trans_msg[3].split(plans_split)
+
+        except Exception as e:
+            logger.error(traceback.format_exc())
+        finally:
+            return reply
+        
     def restore_history(self):
         for mem in memory.data.texts:
-            data = json.loads(mem)
-            assistant_reply = data["Assistant Reply"]
-            result = data["Result"]
-            user_input = data["Human Feedback"]
-            if assistant_reply is not None:
-                assistant_reply_json = fix_json_using_multiple_techniques(assistant_reply)
-                if assistant_reply_json != {}:
-                    validate_json(assistant_reply_json, "llm_response_format_1")
-                    # Get command name and arguments
-                    try:
+            try:
+                data = orjson.loads(mem)
+                assistant_reply = data["Assistant Reply"]
+                result = data["Result"]
+                user_input = data["Human Feedback"]
+                if assistant_reply is not None:
+                    assistant_reply_json = fix_json_using_multiple_techniques(assistant_reply)
+                    if assistant_reply_json != {}:
+                        validate_json(assistant_reply_json, "llm_response_format_1")
                         reply = print_assistant_thoughts(self.ai_name, assistant_reply_json)
-                        plans = []
-                        if 'plans' in reply and reply['plans']:
-                            plans = [plan.replace('- ', '') for plan in reply['plans']]
-                        msg = (
-                            f"{reply['thoughts']}"
-                            f"\n{reply['reasoning']}"
-                            f"\n{reply['criticism']}"
-                            f"\n{result}"
-                            f"\n{plans}"
-                            )
-                        trans_msg = trans(msg).split("\n")
-                        self.history = [History(
-                            thoughts=trans_msg[0],
-                            reasoning=trans_msg[1],
-                            plans=trans_msg[-len(plans):-1],
-                            criticism=trans_msg[2],
-                            system=trans_msg[3],
-                        )] + self.history
-                    except Exception as e:
-                        logger.error(str(e))
-            if result is not None:
-                self.full_message_history.append(create_chat_message("system", result))
+                        reply2 = self.trans_replay_and_history(reply)
+                        self.add_history(reply2, result)
+                    
+                        # Get command name and arguments
+                        
+                if result is not None:
+                    self.full_message_history.append(create_chat_message("system", result))
+            except Exception as e:
+                logger.error("memData: ", mem)
+                logger.error(traceback.format_exc())
+            finally:
+                self.is_restoring_history = False
+                self.is_loading = False
 
-
+    def add_history(self, replay, result):
+        self.history = [History(
+            thoughts=replay['thoughts'],
+            reasoning=replay['reasoning'],
+            plans=replay['plans'],
+            criticism=replay['criticism'],
+            system=result,
+        )] + self.history
     def set_ai_goals_0(self, goal):
         self.ai_goals[0] = goal
     def set_ai_goals_1(self, goal):
@@ -147,13 +173,6 @@ class State(pc.State):
     def set_prompt(self, prompt):
         self.prompt = prompt
     def set_user_input(self, user_input: str):
-        self.command_name = None
-        if not user_input:
-            user_input = "GENERATE NEXT COMMAND JSON"
-        elif user_input.lower() == "n":
-            user_input = "EXIT"
-        elif len(user_input) > 1:
-            self.command_name = "human_feedback"
         self.user_input = user_input
 
     def set_openai_api_key(self, key):
@@ -162,11 +181,13 @@ class State(pc.State):
             cfg.set_openai_api_key(key)
 
     def think(self):
+        memory.clear()
+        memory.flush()
         self.history = []
         self.full_message_history = []
         self.result = None
 
-        config = AIConfig(self.ai_name, self.ai_role, self.ai_goals)
+        config = AIConfig(self.ai_name, self.ai_role, [x for x in self.ai_goals if x])
         config.save()
 
         self.prompt = config.construct_full_prompt()
@@ -176,7 +197,13 @@ class State(pc.State):
         self.is_started = True
 
     def processing(self):
+        self.is_loading = True
         self.is_thinking = True
+
+    def restoring(self):
+        self.is_exist_prev_histoy = False
+        self.is_loading = True
+        self.is_restoring_history = True
 
     def continue_think(self):
         try:
@@ -190,12 +217,14 @@ class State(pc.State):
 
 
             assistant_reply_json = fix_json_using_multiple_techniques(assistant_reply)
+            
             # Print Assistant thoughts
             if assistant_reply_json != {}:
                 validate_json(assistant_reply_json, "llm_response_format_1")
                 # Get command name and arguments
                 try:
                     reply = print_assistant_thoughts(self.ai_name, assistant_reply_json)
+                    reply2 = self.trans_replay_and_history(reply)
                     if not reply:
                         logger.error("ERROR: ", Fore.RED, "reply is empty")
                     else:
@@ -205,7 +234,7 @@ class State(pc.State):
                     if cfg.speak_mode:
                         say_text(f"I want to execute {command_name}")
                 except Exception as e:
-                    logger.error("Error: \n", str(e))
+                    logger.error(traceback.format_exc())
 
                 ### GET USER AUTHORIZATION TO EXECUTE COMMAND ###
                 # Get key press: Prompt the user to press enter to continue or escape
@@ -217,9 +246,17 @@ class State(pc.State):
                 f"ARGUMENTS = {Fore.CYAN}{arguments}{Style.RESET_ALL}",
             )
             user_input = "GENERATE NEXT COMMAND JSON"
-            if not State.user_input:
-                user_input = State.user_input
-                command_name = "human_feedback"
+            
+            if self.user_input:
+                if self.user_input.lower().startswith("y -"):
+                    self.next_action_count = abs(
+                        int(self.user_input.split(" ")[1])
+                    )
+                    user_input = "GENERATE NEXT COMMAND JSON"
+                elif len(user_input) > 1:
+                    command_name = "human_feedback"
+                    user_input = State.user_input
+   
             # Execute command
             if command_name is not None and command_name.lower().startswith("error"):
                 result = (
@@ -241,10 +278,10 @@ class State(pc.State):
             # memory_to_add = {
             #     f"Assistant Reply: {assistant_reply} "
             #     f"\nResult: {result} "
-            #     f"\nHuman Feedback: {user_input} "
+            #     f"\nHuman Feedback: {user_input} 
             # }
-            json_str = json.dumps(memory_to_add)
-            memory.add(json_str)
+            json_str = orjson.dumps(memory_to_add)
+            memory.add(json_str.decode())
             # Check if there's a result from the command append it to the message
             # history
             if result is not None:
@@ -258,36 +295,28 @@ class State(pc.State):
                     "SYSTEM: ", Fore.YELLOW, "Unable to execute command"
                 )
 
-            plans = []
-            if 'plans' in reply and reply['plans']:
-                plans = [plan.replace('- ', '') for plan in reply['plans']]
-
             logger.typewriter_log("PROMPRT", 
                         Fore.YELLOW, 
                     f"ORIGIN = {Fore.CYAN}{memory}{Style.RESET_ALL}")
-
-            msg = (
-                f"{reply['thoughts']}"
-                f"\n{reply['reasoning']}"
-                f"\n{reply['criticism']}"
-                f"\n{result}"
-                f"\n{plans}"
-                )
-            trans_msg = trans(msg).split("\n")
-            self.history = [History(
-                thoughts=trans_msg[0],
-                reasoning=trans_msg[1],
-                plans=trans_msg[-len(plans):-1],
-                criticism=trans_msg[2],
-                system=trans_msg[3],
-            )] + self.history
+            if reply2:
+                self.add_history(reply2, result)
+                logger.typewriter_log("SYSTEM: ", Fore.YELLOW, "add history.")
+            else:
+                logger.typewriter_log("WARNING", Fore.YELLOW, "reply2 is empty.")
         except Exception as e:
             pc.window_alert(str(e))
-            logger.error(str(e))
+            logger.error(traceback.format_exc())
+            logger.error("JSON", orjson.dumps(json_str))
         finally:
             self.is_thinking = False
-            # config = AIConfig(self.ai_name, self.ai_role, self.ai_goals)
-            # config.save()
+            self.is_loading = False
+            self.command_name = None
+            logger.typewriter_log("SYSTEM:", Fore.YELLOW, f"user_input: {self.user_input}, action count: {self.next_action_count}")
+            self.user_input = ""
+            if self.next_action_count > 0:
+                self.next_action_count -= 1
+                self.continue_think()
+
 
 
 def header():
@@ -378,45 +407,57 @@ def header():
         pc.hstack(
                     pc.text('사용자 의견', width='150px'),
                     pc.input(
-                        placeholder='',
+                        placeholder=State.user_input,
                         default_value='',
                         on_change=State.set_user_input
                     ),
                 ),
         pc.center(
-            pc.cond(State.is_started,
-                pc.text(),
-                pc.button(
-                    '생각하기',
-                    bg='black',
-                    color='white',
-                    width='6em',
-                    padding='1em',
-                    on_click=[State.processing, State.starting, State.think],
-                ),
-            ),
-            pc.cond(State.is_started,
-                pc.cond(State.is_thinking,
+            pc.hstack(
+                pc.cond(State.is_started,
                     pc.text(),
-                    pc.hstack(
-                        pc.button(
-                            '계속 생각하기',
-                            bg='black',
-                            color='white',
-                            width='6em',
-                            padding='1em',
-                            on_click=[State.processing, State.continue_think],
-                        ),
-                        pc.button(
-                            '처음부터',
-                            bg='red',
-                            color='white',
-                            width='6em',
-                            padding='1em',
-                            on_click=[State.processing, State.think],
-                        ),
+                    pc.button(
+                        '생각하기',
+                        bg='black',
+                        color='white',
+                        width='6em',
+                        padding='1em',
+                        on_click=[State.processing, State.starting, State.think],
                     ),
-                )
+                ),
+                pc.cond(State.is_started,
+                    pc.cond(State.is_thinking,
+                        pc.text(),
+                        pc.hstack(
+                            pc.button(
+                                '계속 생각하기',
+                                bg='black',
+                                color='white',
+                                width='6em',
+                                padding='1em',
+                                on_click=[State.processing, State.continue_think],
+                            ),
+                            pc.button(
+                                '처음부터',
+                                bg='red',
+                                color='white',
+                                width='6em',
+                                padding='1em',
+                                on_click=[State.processing, State.think],
+                            ),
+                        ),
+                    )
+                ),
+                pc.cond(State.is_exist_prev_histoy,
+                    pc.button(
+                        '복원하기',
+                        bg='black',
+                        color='white',
+                        width='6em',
+                        padding='1em',
+                        on_click=[State.restoring, State.starting, State.restore_history],
+                    )
+                ),
             ),
         ),
         style=question_style,
@@ -455,8 +496,11 @@ def index():
         pc.vstack(
             header(),
             pc.cond(
-                State.is_thinking,
+                State.is_loading,
                 pc.vstack(
+                    pc.cond(State.is_restoring_history,
+                            pc.text("기록 복원중"),
+                            pc.text()),
                     pc.circular_progress(
                         pc.circular_progress_label(
                             'Thinking', color='rgb(0, 0, 0)'
